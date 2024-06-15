@@ -7,7 +7,11 @@ edition = "2021"
 
 [dependencies]
 libc = "*"
+rayon = "*"
 
 [lib]
 name = "findpoints" #生成dll的文件名
 crate-type = ["dylib"]
+
+[build]
+rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+avx2"]
