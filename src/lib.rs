@@ -5,7 +5,7 @@ use std;
 use std::arch::x86_64::*;
 use std::os::raw::c_double;
 
-// 优化后的find_bytes_avx2函数
+// 优化后的find_bytes_avx2函数 进一步优化
 #[target_feature(enable = "avx2")]
 unsafe fn find_bytes_avx2(
     n1: *const u8,
