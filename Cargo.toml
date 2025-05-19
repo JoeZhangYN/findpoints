@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+# RUSTFLAGS="-C target-feature=+avx2" cargo build --release
 
+# set RUSTFLAGS=-C target-feature=+avx2
+# cargo build --release
 [dependencies]
 libc = "*"
 rayon = "*"
@@ -13,5 +16,7 @@ rayon = "*"
 name = "findpoints" #生成dll的文件名
 crate-type = ["dylib"]
 
-[build]
-rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+avx2"]
+[profile.release]
+opt-level = 3
+debug = false
+lto = true

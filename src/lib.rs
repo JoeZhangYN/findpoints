@@ -619,3 +619,54 @@ pub extern "C" fn color_a_equal_color_b_rgb(
         )
     }
 }
+
+
+/// 添加基本的单元测试
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_color_equality() {
+        let color1 = Rgba { r: 100, g: 150, b: 200, a: 255 };
+        let color2 = Rgba { r: 102, g: 153, b: 198, a: 255 };
+        
+        unsafe {
+            // 测试误差范围为5的情况
+            assert!(color_a_equal_color_b(
+                &color1,
+                &color2,
+                5
+            ));
+            
+            // 测试RGB比较
+            assert!(color_a_equal_color_b_rgb(
+                &color1,
+                &color2,
+                5, 5, 5
+            ));
+        }
+    }
+
+    #[test]
+    fn test_color_inequality() {
+        let color1 = Rgba { r: 100, g: 150, b: 200, a: 255 };
+        let color2 = Rgba { r: 110, g: 160, b: 210, a: 255 };
+        
+        unsafe {
+            // 测试误差范围为5的情况
+            assert!(!color_a_equal_color_b(
+                &color1,
+                &color2,
+                5
+            ));
+            
+            // 测试RGB比较
+            assert!(!color_a_equal_color_b_rgb(
+                &color1,
+                &color2,
+                5, 5, 5
+            ));
+        }
+    }
+}
