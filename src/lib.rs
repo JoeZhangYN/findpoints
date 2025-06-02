@@ -4,8 +4,11 @@ use rayon::prelude::*;
 use std;
 use std::arch::x86_64::*;
 use std::os::raw::c_double;
+use std::sync::Mutex;
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicI32, Ordering};
 
-// 优化后的find_bytes_avx2函数 进一步优化
+// 重构原有的 find_bytes_avx2 函数，使用共享的匹配逻辑
 #[target_feature(enable = "avx2")]
 unsafe fn find_bytes_avx2(
     n1: *const u8,
@@ -19,190 +22,36 @@ unsafe fn find_bytes_avx2(
     ignore_g: u8,
     ignore_b: u8,
 ) -> Tuple {
-    let par_x = tup1.x; // 大图宽度
-    let par_y = tup1.y; // 大图高度
-    let sub_x = tup2.x; // 小图宽度
-    let sub_y = tup2.y; // 小图高度
+    let par_x = tup1.x;
+    let par_y = tup1.y;
+    let sub_x = tup2.x;
+    let sub_y = tup2.y;
 
-    // 检测并转换为u8数组
     let numbers1 = std::slice::from_raw_parts(n1, len1);
     let numbers2 = std::slice::from_raw_parts(n2, len2);
 
-    // 预计算忽略色（优化：直接作为32位整数比较）
-    let ignore_color_r = _mm256_set1_epi8(ignore_r as i8);
-    let ignore_color_g = _mm256_set1_epi8(ignore_g as i8);
-    let ignore_color_b = _mm256_set1_epi8(ignore_b as i8);
-
-    // 预计算小图第一个像素（用于快速跳过）
-    let first_pixel_r = numbers2[0];
-    let first_pixel_g = numbers2[1];
-    let first_pixel_b = numbers2[2];
-
-    // 总像素数（预计算，避免重复计算）
-    let total_pixels = (sub_x * sub_y) as usize;
-    let min_match_pixels = (total_pixels as f64 * match_rate) as usize;
+    // 创建匹配参数
+    let match_params = MatchParams {
+        ignore_r,
+        ignore_g,
+        ignore_b,
+        first_pixel_r: numbers2[0],
+        first_pixel_g: numbers2[1],
+        first_pixel_b: numbers2[2],
+        total_pixels: (sub_x * sub_y) as usize,
+        min_match_pixels: ((sub_x * sub_y) as f64 * match_rate) as usize,
+    };
 
     // 创建并行迭代器，遍历大图
     let result = (0..=par_x - sub_x).into_par_iter().find_map_any(|i| {
         for j in 0..=par_y - sub_y {
-            let start_par_index = (j * par_x * 4 + i * 4) as usize;
-
-            // 快速检查：先验证第一个像素
-            let (par_r, par_g, par_b) = (
-                *numbers1.get_unchecked(start_par_index),
-                *numbers1.get_unchecked(start_par_index + 1),
-                *numbers1.get_unchecked(start_par_index + 2),
-            );
-
-            // 跳过忽略色
-            if par_r == ignore_r && par_g == ignore_g && par_b == ignore_b {
-                continue;
-            }
-
-            // 第一个像素匹配检查（快速跳过不可能的位置）
-            if par_r != first_pixel_r || par_g != first_pixel_g || par_b != first_pixel_b {
-                continue;
-            }
-
-            // 开始详细匹配
-            let mut matched_pixels = 0usize;
-            let mut total_checked_pixels = 0usize;
-            let mut early_termination = false;
-
-            // 分块处理，支持早期终止
-            'outer_loop: for block_j in (0..sub_y).step_by(4) {
-                let actual_block_height = std::cmp::min(4, sub_y - block_j);
-
-                for block_i in (0..sub_x).step_by(8) {
-                    let actual_block_width = std::cmp::min(8, sub_x - block_i);
-
-                    // 处理当前8x4块
-                    for local_j in 0..actual_block_height {
-                        let row_j = block_j + local_j;
-                        let sub_row_start = (row_j * sub_x * 4) as usize;
-                        let par_row_start = ((j + row_j) * par_x * 4 + (i + block_i) * 4) as usize;
-
-                        // 计算这一行能处理多少个完整的8像素组
-                        let pixels_remaining = actual_block_width;
-                        let full_vectors = pixels_remaining / 8;
-                        let remaining_pixels = pixels_remaining % 8;
-
-                        // 处理完整的8像素向量
-                        for vec_idx in 0..full_vectors {
-                            let sub_offset = sub_row_start + ((block_i + vec_idx * 8) * 4) as usize;
-                            let par_offset = par_row_start + (vec_idx * 8 * 4) as usize;
-
-                            // 加载32字节（8像素×4通道）
-                            let sub_pixels = _mm256_loadu_si256(
-                                numbers2.as_ptr().add(sub_offset) as *const __m256i
-                            );
-                            let par_pixels = _mm256_loadu_si256(
-                                numbers1.as_ptr().add(par_offset) as *const __m256i
-                            );
-
-                            // 分离R、G、B通道进行比较
-                            let sub_r = _mm256_and_si256(sub_pixels, _mm256_set1_epi32(0x000000FF));
-                            let sub_g = _mm256_and_si256(
-                                _mm256_srli_epi32(sub_pixels, 8),
-                                _mm256_set1_epi32(0x000000FF),
-                            );
-                            let sub_b = _mm256_and_si256(
-                                _mm256_srli_epi32(sub_pixels, 16),
-                                _mm256_set1_epi32(0x000000FF),
-                            );
-
-                            let par_r = _mm256_and_si256(par_pixels, _mm256_set1_epi32(0x000000FF));
-                            let par_g = _mm256_and_si256(
-                                _mm256_srli_epi32(par_pixels, 8),
-                                _mm256_set1_epi32(0x000000FF),
-                            );
-                            let par_b = _mm256_and_si256(
-                                _mm256_srli_epi32(par_pixels, 16),
-                                _mm256_set1_epi32(0x000000FF),
-                            );
-
-                            // 检查是否为忽略色
-                            let ignore_mask_r = _mm256_cmpeq_epi8(par_r, ignore_color_r);
-                            let ignore_mask_g = _mm256_cmpeq_epi8(par_g, ignore_color_g);
-                            let ignore_mask_b = _mm256_cmpeq_epi8(par_b, ignore_color_b);
-                            let ignore_mask = _mm256_and_si256(
-                                _mm256_and_si256(ignore_mask_r, ignore_mask_g),
-                                ignore_mask_b,
-                            );
-
-                            // 比较RGB通道
-                            let match_r = _mm256_cmpeq_epi8(sub_r, par_r);
-                            let match_g = _mm256_cmpeq_epi8(sub_g, par_g);
-                            let match_b = _mm256_cmpeq_epi8(sub_b, par_b);
-                            let match_mask =
-                                _mm256_and_si256(_mm256_and_si256(match_r, match_g), match_b);
-
-                            // 排除忽略色的匹配
-                            let valid_match_mask = _mm256_andnot_si256(ignore_mask, match_mask);
-                            let valid_pixel_mask =
-                                _mm256_xor_si256(ignore_mask, _mm256_set1_epi8(-1));
-
-                            // 统计匹配的像素数（每个像素4字节，所以除以4）
-                            let matched_bytes =
-                                _mm256_movemask_epi8(valid_match_mask).count_ones() as usize;
-                            let total_bytes =
-                                _mm256_movemask_epi8(valid_pixel_mask).count_ones() as usize;
-
-                            matched_pixels += matched_bytes / 4;
-                            total_checked_pixels += total_bytes / 4;
-                        }
-
-                        // 处理剩余像素（不足8个的部分）
-                        for pixel_idx in 0..remaining_pixels {
-                            let pixel_offset = block_i + full_vectors * 8 + pixel_idx;
-                            let sub_offset = sub_row_start + (pixel_offset * 4) as usize;
-                            let par_offset =
-                                par_row_start + ((full_vectors * 8 + pixel_idx) * 4) as usize;
-
-                            let sub_r = *numbers2.get_unchecked(sub_offset);
-                            let sub_g = *numbers2.get_unchecked(sub_offset + 1);
-                            let sub_b = *numbers2.get_unchecked(sub_offset + 2);
-
-                            let par_r = *numbers1.get_unchecked(par_offset);
-                            let par_g = *numbers1.get_unchecked(par_offset + 1);
-                            let par_b = *numbers1.get_unchecked(par_offset + 2);
-
-                            // 跳过忽略色
-                            if par_r == ignore_r && par_g == ignore_g && par_b == ignore_b {
-                                continue;
-                            }
-
-                            total_checked_pixels += 1;
-
-                            if sub_r == par_r && sub_g == par_g && sub_b == par_b {
-                                matched_pixels += 1;
-                            }
-                        }
-                    }
-
-                    // 早期终止检查1：如果当前匹配率已经足够且检查了足够多的像素
-                    if total_checked_pixels > total_pixels / 4
-                        && matched_pixels * total_pixels >= min_match_pixels * total_checked_pixels
-                    {
-                        // 当前匹配率已经满足要求，继续检查剩余部分以确认
-                    }
-
-                    // 早期终止检查2：如果即使剩余像素全部匹配也无法达到阈值
-                    let remaining_pixels = total_pixels - total_checked_pixels;
-                    let max_possible_matches = matched_pixels + remaining_pixels;
-                    if max_possible_matches < min_match_pixels {
-                        early_termination = true;
-                        break 'outer_loop;
-                    }
-                }
-            }
-
-            // 最终匹配率检查
-            if !early_termination && total_checked_pixels > 0 {
-                let final_match_rate = matched_pixels as f64 / total_checked_pixels as f64;
-                if final_match_rate >= match_rate {
-                    return Some(Tuple { x: i, y: j });
-                }
+            // 使用共享的匹配函数
+            if perform_detailed_match_avx2(
+                numbers1, numbers2,
+                i, j, par_x, sub_x, sub_y,
+                &match_params
+            ) {
+                return Some(Tuple { x: i, y: j });
             }
         }
         None
@@ -579,6 +428,7 @@ pub struct Region {
     pub height: u32,
 }
 
+// 同样重构 find_bytes_in_region_avx2
 #[target_feature(enable = "avx2")]
 unsafe fn find_bytes_in_region_avx2(
     n1: *const u8,
@@ -593,236 +443,53 @@ unsafe fn find_bytes_in_region_avx2(
     ignore_g: u8,
     ignore_b: u8,
 ) -> Tuple {
-    let par_x = tup1.x; // 大图宽度
-    let par_y = tup1.y; // 大图高度
-    let sub_x = tup2.x; // 小图宽度
-    let sub_y = tup2.y; // 小图高度
+    let par_x = tup1.x;
+    let par_y = tup1.y;
+    let sub_x = tup2.x;
+    let sub_y = tup2.y;
 
     // 验证区域合法性
     if region.x >= par_x || region.y >= par_y {
-        return Tuple {
-            x: 245760,
-            y: 143640,
-        };
+        return Tuple { x: 245760, y: 143640 };
     }
 
-    // 计算实际搜索区域的结束位置
     let region_end_x = (region.x + region.width).min(par_x);
     let region_end_y = (region.y + region.height).min(par_y);
 
-    // 确保区域能容纳子图
     if region_end_x < region.x + sub_x || region_end_y < region.y + sub_y {
-        return Tuple {
-            x: 245760,
-            y: 143640,
-        };
+        return Tuple { x: 245760, y: 143640 };
     }
 
-    // 检测并转换为u8数组
     let numbers1 = std::slice::from_raw_parts(n1, len1);
     let numbers2 = std::slice::from_raw_parts(n2, len2);
 
-    // 预计算忽略色（优化：直接作为32位整数比较）
-    let ignore_color_r = _mm256_set1_epi8(ignore_r as i8);
-    let ignore_color_g = _mm256_set1_epi8(ignore_g as i8);
-    let ignore_color_b = _mm256_set1_epi8(ignore_b as i8);
+    let match_params = MatchParams {
+        ignore_r,
+        ignore_g,
+        ignore_b,
+        first_pixel_r: numbers2[0],
+        first_pixel_g: numbers2[1],
+        first_pixel_b: numbers2[2],
+        total_pixels: (sub_x * sub_y) as usize,
+        min_match_pixels: ((sub_x * sub_y) as f64 * match_rate) as usize,
+    };
 
-    // 预计算小图第一个像素（用于快速跳过）
-    let first_pixel_r = numbers2[0];
-    let first_pixel_g = numbers2[1];
-    let first_pixel_b = numbers2[2];
-
-    // 总像素数（预计算，避免重复计算）
-    let total_pixels = (sub_x * sub_y) as usize;
-    let min_match_pixels = (total_pixels as f64 * match_rate) as usize;
-
-    // 创建并行迭代器，只在指定区域内遍历
     let result = (region.x..=region_end_x - sub_x)
         .into_par_iter()
         .find_map_any(|i| {
             for j in region.y..=region_end_y - sub_y {
-                let start_par_index = (j * par_x * 4 + i * 4) as usize;
-
-                // 快速检查：先验证第一个像素
-                let (par_r, par_g, par_b) = (
-                    *numbers1.get_unchecked(start_par_index),
-                    *numbers1.get_unchecked(start_par_index + 1),
-                    *numbers1.get_unchecked(start_par_index + 2),
-                );
-
-                // 跳过忽略色
-                if par_r == ignore_r && par_g == ignore_g && par_b == ignore_b {
-                    continue;
-                }
-
-                // 第一个像素匹配检查（快速跳过不可能的位置）
-                if par_r != first_pixel_r || par_g != first_pixel_g || par_b != first_pixel_b {
-                    continue;
-                }
-
-                // 开始详细匹配
-                let mut matched_pixels = 0usize;
-                let mut total_checked_pixels = 0usize;
-                let mut early_termination = false;
-
-                // 分块处理，支持早期终止
-                'outer_loop: for block_j in (0..sub_y).step_by(4) {
-                    let actual_block_height = std::cmp::min(4, sub_y - block_j);
-
-                    for block_i in (0..sub_x).step_by(8) {
-                        let actual_block_width = std::cmp::min(8, sub_x - block_i);
-
-                        // 处理当前8x4块
-                        for local_j in 0..actual_block_height {
-                            let row_j = block_j + local_j;
-                            let sub_row_start = (row_j * sub_x * 4) as usize;
-                            let par_row_start =
-                                ((j + row_j) * par_x * 4 + (i + block_i) * 4) as usize;
-
-                            // 计算这一行能处理多少个完整的8像素组
-                            let pixels_remaining = actual_block_width;
-                            let full_vectors = pixels_remaining / 8;
-                            let remaining_pixels = pixels_remaining % 8;
-
-                            // 处理完整的8像素向量
-                            for vec_idx in 0..full_vectors {
-                                let sub_offset =
-                                    sub_row_start + ((block_i + vec_idx * 8) * 4) as usize;
-                                let par_offset = par_row_start + (vec_idx * 8 * 4) as usize;
-
-                                // 验证内存访问边界
-                                if par_offset + 32 > len1 || sub_offset + 32 > len2 {
-                                    break;
-                                }
-
-                                // 加载32字节（8像素×4通道）
-                                let sub_pixels = _mm256_loadu_si256(
-                                    numbers2.as_ptr().add(sub_offset) as *const __m256i,
-                                );
-                                let par_pixels = _mm256_loadu_si256(
-                                    numbers1.as_ptr().add(par_offset) as *const __m256i,
-                                );
-
-                                // 分离R、G、B通道进行比较
-                                let sub_r =
-                                    _mm256_and_si256(sub_pixels, _mm256_set1_epi32(0x000000FF));
-                                let sub_g = _mm256_and_si256(
-                                    _mm256_srli_epi32(sub_pixels, 8),
-                                    _mm256_set1_epi32(0x000000FF),
-                                );
-                                let sub_b = _mm256_and_si256(
-                                    _mm256_srli_epi32(sub_pixels, 16),
-                                    _mm256_set1_epi32(0x000000FF),
-                                );
-
-                                let par_r =
-                                    _mm256_and_si256(par_pixels, _mm256_set1_epi32(0x000000FF));
-                                let par_g = _mm256_and_si256(
-                                    _mm256_srli_epi32(par_pixels, 8),
-                                    _mm256_set1_epi32(0x000000FF),
-                                );
-                                let par_b = _mm256_and_si256(
-                                    _mm256_srli_epi32(par_pixels, 16),
-                                    _mm256_set1_epi32(0x000000FF),
-                                );
-
-                                // 检查是否为忽略色
-                                let ignore_mask_r = _mm256_cmpeq_epi8(par_r, ignore_color_r);
-                                let ignore_mask_g = _mm256_cmpeq_epi8(par_g, ignore_color_g);
-                                let ignore_mask_b = _mm256_cmpeq_epi8(par_b, ignore_color_b);
-                                let ignore_mask = _mm256_and_si256(
-                                    _mm256_and_si256(ignore_mask_r, ignore_mask_g),
-                                    ignore_mask_b,
-                                );
-
-                                // 比较RGB通道
-                                let match_r = _mm256_cmpeq_epi8(sub_r, par_r);
-                                let match_g = _mm256_cmpeq_epi8(sub_g, par_g);
-                                let match_b = _mm256_cmpeq_epi8(sub_b, par_b);
-                                let match_mask =
-                                    _mm256_and_si256(_mm256_and_si256(match_r, match_g), match_b);
-
-                                // 排除忽略色的匹配
-                                let valid_match_mask = _mm256_andnot_si256(ignore_mask, match_mask);
-                                let valid_pixel_mask =
-                                    _mm256_xor_si256(ignore_mask, _mm256_set1_epi8(-1));
-
-                                // 统计匹配的像素数（每个像素4字节，所以除以4）
-                                let matched_bytes =
-                                    _mm256_movemask_epi8(valid_match_mask).count_ones() as usize;
-                                let total_bytes =
-                                    _mm256_movemask_epi8(valid_pixel_mask).count_ones() as usize;
-
-                                matched_pixels += matched_bytes / 4;
-                                total_checked_pixels += total_bytes / 4;
-                            }
-
-                            // 处理剩余像素（不足8个的部分）
-                            for pixel_idx in 0..remaining_pixels {
-                                let pixel_offset = block_i + full_vectors * 8 + pixel_idx;
-                                let sub_offset = sub_row_start + (pixel_offset * 4) as usize;
-                                let par_offset =
-                                    par_row_start + ((full_vectors * 8 + pixel_idx) * 4) as usize;
-
-                                // 验证内存访问边界
-                                if par_offset + 3 >= len1 || sub_offset + 3 >= len2 {
-                                    break;
-                                }
-
-                                let sub_r = *numbers2.get_unchecked(sub_offset);
-                                let sub_g = *numbers2.get_unchecked(sub_offset + 1);
-                                let sub_b = *numbers2.get_unchecked(sub_offset + 2);
-
-                                let par_r = *numbers1.get_unchecked(par_offset);
-                                let par_g = *numbers1.get_unchecked(par_offset + 1);
-                                let par_b = *numbers1.get_unchecked(par_offset + 2);
-
-                                // 跳过忽略色
-                                if par_r == ignore_r && par_g == ignore_g && par_b == ignore_b {
-                                    continue;
-                                }
-
-                                total_checked_pixels += 1;
-
-                                if sub_r == par_r && sub_g == par_g && sub_b == par_b {
-                                    matched_pixels += 1;
-                                }
-                            }
-                        }
-
-                        // 早期终止检查1：如果当前匹配率已经足够且检查了足够多的像素
-                        if total_checked_pixels > total_pixels / 4
-                            && matched_pixels * total_pixels
-                                >= min_match_pixels * total_checked_pixels
-                        {
-                            // 当前匹配率已经满足要求，继续检查剩余部分以确认
-                        }
-
-                        // 早期终止检查2：如果即使剩余像素全部匹配也无法达到阈值
-                        let remaining_pixels = total_pixels - total_checked_pixels;
-                        let max_possible_matches = matched_pixels + remaining_pixels;
-                        if max_possible_matches < min_match_pixels {
-                            early_termination = true;
-                            break 'outer_loop;
-                        }
-                    }
-                }
-
-                // 最终匹配率检查
-                if !early_termination && total_checked_pixels > 0 {
-                    let final_match_rate = matched_pixels as f64 / total_checked_pixels as f64;
-                    if final_match_rate >= match_rate {
-                        return Some(Tuple { x: i, y: j });
-                    }
+                if perform_detailed_match_avx2(
+                    numbers1, numbers2,
+                    i, j, par_x, sub_x, sub_y,
+                    &match_params
+                ) {
+                    return Some(Tuple { x: i, y: j });
                 }
             }
             None
         });
 
-    result.unwrap_or(Tuple {
-        x: 245760,
-        y: 143640,
-    })
+    result.unwrap_or(Tuple { x: 245760, y: 143640 })
 }
 
 #[no_mangle]
@@ -844,6 +511,371 @@ pub extern "C" fn FindBytesInRegion(
             n1, len1, tup1, n2, len2, tup2, region, match_rate, ignore_r, ignore_g, ignore_b,
         )
     }
+}
+
+#[repr(C)]
+pub struct MultipleResults {
+    pub points: *mut Tuple,  // 指向结果数组的指针
+    pub count: i32,          // 实际找到的数量
+    pub capacity: i32,       // 分配的容量
+}
+
+#[repr(C)]
+pub struct FindAllConfig {
+    pub max_results: i32,     // 最大结果数
+    pub min_distance: i32,    // 结果之间的最小距离
+    pub early_exit: bool,     // 是否在达到max_results后提前退出
+}
+
+/// 查找所有匹配的图像位置
+#[no_mangle]
+pub extern "C" fn FindAllBytesInRegion(
+    n1: *const u8,
+    len1: usize,
+    tup1: Tuple,
+    n2: *const u8,
+    len2: usize,
+    tup2: Tuple,
+    region: Region,
+    match_rate: c_double,
+    ignore_r: u8,
+    ignore_g: u8,
+    ignore_b: u8,
+    config: FindAllConfig,
+) -> MultipleResults {
+    unsafe {
+        find_all_bytes_in_region_avx2(
+            n1, len1, tup1, n2, len2, tup2, region, match_rate, 
+            ignore_r, ignore_g, ignore_b, config,
+        )
+    }
+}
+
+/// 释放结果内存
+#[no_mangle]
+pub extern "C" fn FreeMultipleResults(results: MultipleResults) {
+    if !results.points.is_null() && results.capacity > 0 {
+        unsafe {
+            // 使用 Vec 来正确释放内存
+            Vec::from_raw_parts(results.points, results.count as usize, results.capacity as usize);
+        }
+    }
+}
+
+/// AVX2 优化的批量查找实现
+#[target_feature(enable = "avx2")]
+unsafe fn find_all_bytes_in_region_avx2(
+    n1: *const u8,
+    len1: usize,
+    tup1: Tuple,
+    n2: *const u8,
+    len2: usize,
+    tup2: Tuple,
+    region: Region,
+    match_rate: c_double,
+    ignore_r: u8,
+    ignore_g: u8,
+    ignore_b: u8,
+    config: FindAllConfig,
+) -> MultipleResults {
+    let par_x = tup1.x;
+    let par_y = tup1.y;
+    let sub_x = tup2.x;
+    let sub_y = tup2.y;
+
+    // 验证区域合法性
+    if region.x >= par_x || region.y >= par_y {
+        return MultipleResults {
+            points: std::ptr::null_mut(),
+            count: 0,
+            capacity: 0,
+        };
+    }
+
+    // 计算实际搜索区域
+    let region_end_x = (region.x + region.width).min(par_x);
+    let region_end_y = (region.y + region.height).min(par_y);
+
+    if region_end_x < region.x + sub_x || region_end_y < region.y + sub_y {
+        return MultipleResults {
+            points: std::ptr::null_mut(),
+            count: 0,
+            capacity: 0,
+        };
+    }
+
+    let numbers1 = std::slice::from_raw_parts(n1, len1);
+    let numbers2 = std::slice::from_raw_parts(n2, len2);
+
+    // 预计算匹配参数
+    let match_params = MatchParams {
+        ignore_r,
+        ignore_g,
+        ignore_b,
+        first_pixel_r: numbers2[0],
+        first_pixel_g: numbers2[1],
+        first_pixel_b: numbers2[2],
+        total_pixels: (sub_x * sub_y) as usize,
+        min_match_pixels: ((sub_x * sub_y) as f64 * match_rate) as usize,
+    };
+
+    // 明确指定类型为 Vec<Tuple>
+    let results: Mutex<Vec<Tuple>> = Mutex::new(Vec::with_capacity(config.max_results as usize));
+    let found_count = AtomicI32::new(0);
+
+    // 分区并行搜索
+    let strip_height = (sub_y as usize).max(50);
+    let num_strips = ((region_end_y - region.y) as usize + strip_height - 1) / strip_height;
+
+    (0..num_strips).into_par_iter().for_each(|strip_idx| {
+        let strip_start_y = region.y + (strip_idx * strip_height) as u32;
+        let strip_end_y = (strip_start_y + strip_height as u32 + sub_y).min(region_end_y);
+
+        // 早期退出检查
+        if config.early_exit && found_count.load(Ordering::Relaxed) >= config.max_results {
+            return;
+        }
+
+        // 在条带内搜索
+        for j in strip_start_y..=strip_end_y.saturating_sub(sub_y) {
+            for i in region.x..=region_end_x - sub_x {
+                // 再次检查是否需要早期退出
+                if config.early_exit && found_count.load(Ordering::Relaxed) >= config.max_results {
+                    return;
+                }
+
+                // 使用抽取的匹配函数
+                if perform_detailed_match_avx2(
+                    numbers1, numbers2,
+                    i, j, par_x, sub_x, sub_y,
+                    &match_params
+                ) {
+                    // 检查与已有结果的距离
+                    let mut should_add = true;
+                    
+                    if config.min_distance > 0 {
+                        let mut results_guard = results.lock().unwrap();
+                        
+                        // 明确 existing 的类型
+                        for existing in results_guard.iter() {
+                            let dx = ((existing.x as i32) - (i as i32)).abs();
+                            let dy = ((existing.y as i32) - (j as i32)).abs();
+                            
+                            if dx < config.min_distance && dy < config.min_distance {
+                                should_add = false;
+                                break;
+                            }
+                        }
+                        
+                        if should_add {
+                            results_guard.push(Tuple { x: i, y: j });
+                            found_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else {
+                        results.lock().unwrap().push(Tuple { x: i, y: j });
+                        found_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    });
+
+    // 将结果转换为C可用的格式
+    let mut final_results = results.into_inner().unwrap();
+    let count = final_results.len() as i32;
+    let capacity = final_results.capacity() as i32;
+    let points = final_results.as_mut_ptr();
+    
+    // 防止Vec自动释放内存
+    std::mem::forget(final_results);
+
+    MultipleResults {
+        points,
+        count,
+        capacity,
+    }
+}
+
+// 匹配参数结构体，避免重复传递参数
+struct MatchParams {
+    ignore_r: u8,
+    ignore_g: u8,
+    ignore_b: u8,
+    first_pixel_r: u8,
+    first_pixel_g: u8,
+    first_pixel_b: u8,
+    total_pixels: usize,
+    min_match_pixels: usize,
+}
+
+// 抽取详细匹配逻辑为独立函数
+#[inline(always)]
+unsafe fn perform_detailed_match_avx2(
+    numbers1: &[u8],
+    numbers2: &[u8],
+    i: u32,
+    j: u32,
+    par_x: u32,
+    sub_x: u32,
+    sub_y: u32,
+    params: &MatchParams,
+) -> bool {
+    let start_par_index = (j * par_x * 4 + i * 4) as usize;
+
+    // 快速检查第一个像素
+    let (par_r, par_g, par_b) = (
+        *numbers1.get_unchecked(start_par_index),
+        *numbers1.get_unchecked(start_par_index + 1),
+        *numbers1.get_unchecked(start_par_index + 2),
+    );
+
+    // 跳过忽略色
+    if par_r == params.ignore_r && par_g == params.ignore_g && par_b == params.ignore_b {
+        return false;
+    }
+
+    // 第一个像素匹配检查
+    if par_r != params.first_pixel_r || par_g != params.first_pixel_g || par_b != params.first_pixel_b {
+        return false;
+    }
+
+    // 预计算忽略色的AVX2向量
+    let ignore_color_r = _mm256_set1_epi8(params.ignore_r as i8);
+    let ignore_color_g = _mm256_set1_epi8(params.ignore_g as i8);
+    let ignore_color_b = _mm256_set1_epi8(params.ignore_b as i8);
+
+    let mut matched_pixels = 0usize;
+    let mut total_checked_pixels = 0usize;
+
+    // 分块处理
+    for block_j in (0..sub_y).step_by(4) {
+        let actual_block_height = std::cmp::min(4, sub_y - block_j);
+
+        for block_i in (0..sub_x).step_by(8) {
+            let actual_block_width = std::cmp::min(8, sub_x - block_i);
+
+            for local_j in 0..actual_block_height {
+                let row_j = block_j + local_j;
+                let sub_row_start = (row_j * sub_x * 4) as usize;
+                let par_row_start = ((j + row_j) * par_x * 4 + (i + block_i) * 4) as usize;
+
+                let pixels_remaining = actual_block_width;
+                let full_vectors = pixels_remaining / 8;
+                let remaining_pixels = pixels_remaining % 8;
+
+                // AVX2 向量处理
+                for vec_idx in 0..full_vectors {
+                    let sub_offset = sub_row_start + ((block_i + vec_idx * 8) * 4) as usize;
+                    let par_offset = par_row_start + (vec_idx * 8 * 4) as usize;
+
+                    // 检查边界
+                    if par_offset + 32 > numbers1.len() || sub_offset + 32 > numbers2.len() {
+                        break;
+                    }
+
+                    // 加载32字节（8像素×4通道）
+                    let sub_pixels = _mm256_loadu_si256(
+                        numbers2.as_ptr().add(sub_offset) as *const __m256i
+                    );
+                    let par_pixels = _mm256_loadu_si256(
+                        numbers1.as_ptr().add(par_offset) as *const __m256i
+                    );
+
+                    // 分离RGB通道
+                    let sub_r = _mm256_and_si256(sub_pixels, _mm256_set1_epi32(0x000000FF));
+                    let sub_g = _mm256_and_si256(
+                        _mm256_srli_epi32(sub_pixels, 8),
+                        _mm256_set1_epi32(0x000000FF),
+                    );
+                    let sub_b = _mm256_and_si256(
+                        _mm256_srli_epi32(sub_pixels, 16),
+                        _mm256_set1_epi32(0x000000FF),
+                    );
+
+                    let par_r = _mm256_and_si256(par_pixels, _mm256_set1_epi32(0x000000FF));
+                    let par_g = _mm256_and_si256(
+                        _mm256_srli_epi32(par_pixels, 8),
+                        _mm256_set1_epi32(0x000000FF),
+                    );
+                    let par_b = _mm256_and_si256(
+                        _mm256_srli_epi32(par_pixels, 16),
+                        _mm256_set1_epi32(0x000000FF),
+                    );
+
+                    // 检查是否为忽略色
+                    let ignore_mask_r = _mm256_cmpeq_epi8(par_r, ignore_color_r);
+                    let ignore_mask_g = _mm256_cmpeq_epi8(par_g, ignore_color_g);
+                    let ignore_mask_b = _mm256_cmpeq_epi8(par_b, ignore_color_b);
+                    let ignore_mask = _mm256_and_si256(
+                        _mm256_and_si256(ignore_mask_r, ignore_mask_g),
+                        ignore_mask_b,
+                    );
+
+                    // 比较RGB通道
+                    let match_r = _mm256_cmpeq_epi8(sub_r, par_r);
+                    let match_g = _mm256_cmpeq_epi8(sub_g, par_g);
+                    let match_b = _mm256_cmpeq_epi8(sub_b, par_b);
+                    let match_mask = _mm256_and_si256(
+                        _mm256_and_si256(match_r, match_g), 
+                        match_b
+                    );
+
+                    // 排除忽略色的匹配
+                    let valid_match_mask = _mm256_andnot_si256(ignore_mask, match_mask);
+                    let valid_pixel_mask = _mm256_xor_si256(ignore_mask, _mm256_set1_epi8(-1));
+
+                    // 统计匹配的像素数
+                    let matched_bytes = _mm256_movemask_epi8(valid_match_mask).count_ones() as usize;
+                    let total_bytes = _mm256_movemask_epi8(valid_pixel_mask).count_ones() as usize;
+
+                    matched_pixels += matched_bytes / 4;
+                    total_checked_pixels += total_bytes / 4;
+                }
+
+                // 处理剩余像素
+                for pixel_idx in 0..remaining_pixels {
+                    let pixel_offset = block_i + full_vectors * 8 + pixel_idx;
+                    let sub_offset = sub_row_start + (pixel_offset * 4) as usize;
+                    let par_offset = par_row_start + ((full_vectors * 8 + pixel_idx) * 4) as usize;
+
+                    let sub_r = *numbers2.get_unchecked(sub_offset);
+                    let sub_g = *numbers2.get_unchecked(sub_offset + 1);
+                    let sub_b = *numbers2.get_unchecked(sub_offset + 2);
+
+                    let par_r = *numbers1.get_unchecked(par_offset);
+                    let par_g = *numbers1.get_unchecked(par_offset + 1);
+                    let par_b = *numbers1.get_unchecked(par_offset + 2);
+
+                    // 跳过忽略色
+                    if par_r == params.ignore_r && par_g == params.ignore_g && par_b == params.ignore_b {
+                        continue;
+                    }
+
+                    total_checked_pixels += 1;
+
+                    if sub_r == par_r && sub_g == par_g && sub_b == par_b {
+                        matched_pixels += 1;
+                    }
+                }
+            }
+
+            // 早期终止检查
+            let remaining_pixels = params.total_pixels - total_checked_pixels;
+            let max_possible_matches = matched_pixels + remaining_pixels;
+            
+            if max_possible_matches < params.min_match_pixels {
+                return false;
+            }
+        }
+    }
+
+    // 最终匹配率检查
+    if total_checked_pixels > 0 {
+        let final_match_rate = matched_pixels as f64 / total_checked_pixels as f64;
+        return final_match_rate >= (params.min_match_pixels as f64 / params.total_pixels as f64);
+    }
+    
+    false
 }
 
 #[repr(C)]
