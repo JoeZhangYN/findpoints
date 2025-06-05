@@ -4,9 +4,8 @@ use rayon::prelude::*;
 use std;
 use std::arch::x86_64::*;
 use std::os::raw::c_double;
-use std::sync::Mutex;
-use rayon::prelude::*;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::Mutex;
 
 // 重构原有的 find_bytes_avx2 函数，使用共享的匹配逻辑
 #[target_feature(enable = "avx2")]
@@ -47,9 +46,14 @@ unsafe fn find_bytes_avx2(
         for j in 0..=par_y - sub_y {
             // 使用共享的匹配函数
             if perform_detailed_match_avx2(
-                numbers1, numbers2,
-                i, j, par_x, sub_x, sub_y,
-                &match_params
+                numbers1,
+                numbers2,
+                i,
+                j,
+                par_x,
+                sub_x,
+                sub_y,
+                &match_params,
             ) {
                 return Some(Tuple { x: i, y: j });
             }
@@ -450,14 +454,20 @@ unsafe fn find_bytes_in_region_avx2(
 
     // 验证区域合法性
     if region.x >= par_x || region.y >= par_y {
-        return Tuple { x: 245760, y: 143640 };
+        return Tuple {
+            x: 245760,
+            y: 143640,
+        };
     }
 
     let region_end_x = (region.x + region.width).min(par_x);
     let region_end_y = (region.y + region.height).min(par_y);
 
     if region_end_x < region.x + sub_x || region_end_y < region.y + sub_y {
-        return Tuple { x: 245760, y: 143640 };
+        return Tuple {
+            x: 245760,
+            y: 143640,
+        };
     }
 
     let numbers1 = std::slice::from_raw_parts(n1, len1);
@@ -479,9 +489,14 @@ unsafe fn find_bytes_in_region_avx2(
         .find_map_any(|i| {
             for j in region.y..=region_end_y - sub_y {
                 if perform_detailed_match_avx2(
-                    numbers1, numbers2,
-                    i, j, par_x, sub_x, sub_y,
-                    &match_params
+                    numbers1,
+                    numbers2,
+                    i,
+                    j,
+                    par_x,
+                    sub_x,
+                    sub_y,
+                    &match_params,
                 ) {
                     return Some(Tuple { x: i, y: j });
                 }
@@ -489,7 +504,10 @@ unsafe fn find_bytes_in_region_avx2(
             None
         });
 
-    result.unwrap_or(Tuple { x: 245760, y: 143640 })
+    result.unwrap_or(Tuple {
+        x: 245760,
+        y: 143640,
+    })
 }
 
 #[no_mangle]
@@ -515,16 +533,16 @@ pub extern "C" fn FindBytesInRegion(
 
 #[repr(C)]
 pub struct MultipleResults {
-    pub points: *mut Tuple,  // 指向结果数组的指针
-    pub count: i32,          // 实际找到的数量
-    pub capacity: i32,       // 分配的容量
+    pub points: *mut Tuple, // 指向结果数组的指针
+    pub count: i32,         // 实际找到的数量
+    pub capacity: i32,      // 分配的容量
 }
 
 #[repr(C)]
 pub struct FindAllConfig {
-    pub max_results: i32,     // 最大结果数
-    pub min_distance: i32,    // 结果之间的最小距离
-    pub early_exit: bool,     // 是否在达到max_results后提前退出
+    pub max_results: i32,  // 最大结果数
+    pub min_distance: i32, // 结果之间的最小距离
+    pub early_exit: bool,  // 是否在达到max_results后提前退出
 }
 
 /// 查找所有匹配的图像位置
@@ -545,8 +563,8 @@ pub extern "C" fn FindAllBytesInRegion(
 ) -> MultipleResults {
     unsafe {
         find_all_bytes_in_region_avx2(
-            n1, len1, tup1, n2, len2, tup2, region, match_rate, 
-            ignore_r, ignore_g, ignore_b, config,
+            n1, len1, tup1, n2, len2, tup2, region, match_rate, ignore_r, ignore_g, ignore_b,
+            config,
         )
     }
 }
@@ -557,7 +575,11 @@ pub extern "C" fn FreeMultipleResults(results: MultipleResults) {
     if !results.points.is_null() && results.capacity > 0 {
         unsafe {
             // 使用 Vec 来正确释放内存
-            Vec::from_raw_parts(results.points, results.count as usize, results.capacity as usize);
+            Vec::from_raw_parts(
+                results.points,
+                results.count as usize,
+                results.capacity as usize,
+            );
         }
     }
 }
@@ -646,27 +668,32 @@ unsafe fn find_all_bytes_in_region_avx2(
 
                 // 使用抽取的匹配函数
                 if perform_detailed_match_avx2(
-                    numbers1, numbers2,
-                    i, j, par_x, sub_x, sub_y,
-                    &match_params
+                    numbers1,
+                    numbers2,
+                    i,
+                    j,
+                    par_x,
+                    sub_x,
+                    sub_y,
+                    &match_params,
                 ) {
                     // 检查与已有结果的距离
                     let mut should_add = true;
-                    
+
                     if config.min_distance > 0 {
                         let mut results_guard = results.lock().unwrap();
-                        
+
                         // 明确 existing 的类型
                         for existing in results_guard.iter() {
                             let dx = ((existing.x as i32) - (i as i32)).abs();
                             let dy = ((existing.y as i32) - (j as i32)).abs();
-                            
+
                             if dx < config.min_distance && dy < config.min_distance {
                                 should_add = false;
                                 break;
                             }
                         }
-                        
+
                         if should_add {
                             results_guard.push(Tuple { x: i, y: j });
                             found_count.fetch_add(1, Ordering::Relaxed);
@@ -685,7 +712,7 @@ unsafe fn find_all_bytes_in_region_avx2(
     let count = final_results.len() as i32;
     let capacity = final_results.capacity() as i32;
     let points = final_results.as_mut_ptr();
-    
+
     // 防止Vec自动释放内存
     std::mem::forget(final_results);
 
@@ -735,7 +762,10 @@ unsafe fn perform_detailed_match_avx2(
     }
 
     // 第一个像素匹配检查
-    if par_r != params.first_pixel_r || par_g != params.first_pixel_g || par_b != params.first_pixel_b {
+    if par_r != params.first_pixel_r
+        || par_g != params.first_pixel_g
+        || par_b != params.first_pixel_b
+    {
         return false;
     }
 
@@ -774,12 +804,10 @@ unsafe fn perform_detailed_match_avx2(
                     }
 
                     // 加载32字节（8像素×4通道）
-                    let sub_pixels = _mm256_loadu_si256(
-                        numbers2.as_ptr().add(sub_offset) as *const __m256i
-                    );
-                    let par_pixels = _mm256_loadu_si256(
-                        numbers1.as_ptr().add(par_offset) as *const __m256i
-                    );
+                    let sub_pixels =
+                        _mm256_loadu_si256(numbers2.as_ptr().add(sub_offset) as *const __m256i);
+                    let par_pixels =
+                        _mm256_loadu_si256(numbers1.as_ptr().add(par_offset) as *const __m256i);
 
                     // 分离RGB通道
                     let sub_r = _mm256_and_si256(sub_pixels, _mm256_set1_epi32(0x000000FF));
@@ -815,17 +843,15 @@ unsafe fn perform_detailed_match_avx2(
                     let match_r = _mm256_cmpeq_epi8(sub_r, par_r);
                     let match_g = _mm256_cmpeq_epi8(sub_g, par_g);
                     let match_b = _mm256_cmpeq_epi8(sub_b, par_b);
-                    let match_mask = _mm256_and_si256(
-                        _mm256_and_si256(match_r, match_g), 
-                        match_b
-                    );
+                    let match_mask = _mm256_and_si256(_mm256_and_si256(match_r, match_g), match_b);
 
                     // 排除忽略色的匹配
                     let valid_match_mask = _mm256_andnot_si256(ignore_mask, match_mask);
                     let valid_pixel_mask = _mm256_xor_si256(ignore_mask, _mm256_set1_epi8(-1));
 
                     // 统计匹配的像素数
-                    let matched_bytes = _mm256_movemask_epi8(valid_match_mask).count_ones() as usize;
+                    let matched_bytes =
+                        _mm256_movemask_epi8(valid_match_mask).count_ones() as usize;
                     let total_bytes = _mm256_movemask_epi8(valid_pixel_mask).count_ones() as usize;
 
                     matched_pixels += matched_bytes / 4;
@@ -847,7 +873,10 @@ unsafe fn perform_detailed_match_avx2(
                     let par_b = *numbers1.get_unchecked(par_offset + 2);
 
                     // 跳过忽略色
-                    if par_r == params.ignore_r && par_g == params.ignore_g && par_b == params.ignore_b {
+                    if par_r == params.ignore_r
+                        && par_g == params.ignore_g
+                        && par_b == params.ignore_b
+                    {
                         continue;
                     }
 
@@ -862,7 +891,7 @@ unsafe fn perform_detailed_match_avx2(
             // 早期终止检查
             let remaining_pixels = params.total_pixels - total_checked_pixels;
             let max_possible_matches = matched_pixels + remaining_pixels;
-            
+
             if max_possible_matches < params.min_match_pixels {
                 return false;
             }
@@ -874,7 +903,7 @@ unsafe fn perform_detailed_match_avx2(
         let final_match_rate = matched_pixels as f64 / total_checked_pixels as f64;
         return final_match_rate >= (params.min_match_pixels as f64 / params.total_pixels as f64);
     }
-    
+
     false
 }
 
@@ -993,13 +1022,11 @@ mod tests {
             a: 255,
         };
 
-        unsafe {
-            // 测试误差范围为5的情况
-            assert!(color_a_equal_color_b(&color1, &color2, 5));
+        // 测试误差范围为5的情况
+        assert!(color_a_equal_color_b(&color1, &color2, 5));
 
-            // 测试RGB比较
-            assert!(color_a_equal_color_b_rgb(&color1, &color2, 5, 5, 5));
-        }
+        // 测试RGB比较
+        assert!(color_a_equal_color_b_rgb(&color1, &color2, 5, 5, 5));
     }
 
     #[test]
@@ -1017,12 +1044,10 @@ mod tests {
             a: 255,
         };
 
-        unsafe {
-            // 测试误差范围为5的情况
-            assert!(!color_a_equal_color_b(&color1, &color2, 5));
+        // 测试误差范围为5的情况
+        assert!(!color_a_equal_color_b(&color1, &color2, 5));
 
-            // 测试RGB比较
-            assert!(!color_a_equal_color_b_rgb(&color1, &color2, 5, 5, 5));
-        }
+        // 测试RGB比较
+        assert!(!color_a_equal_color_b_rgb(&color1, &color2, 5, 5, 5));
     }
 }
