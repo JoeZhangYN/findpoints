@@ -1,17 +1,24 @@
 [package]
 name = "findpoints"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 # RUSTFLAGS="-C target-feature=+avx2" cargo build --release
-# cargo rustc --release -- -C target-cpu=native -C target-feature=+avx2
+# cargo rustc --release -- -C target-cpu=native -C target-feature=+avx2,+avx512f,+avx512bw
+# 理论上target-cpu=native会自动根据支持指令集启用
+# avx512f - AVX512 Foundation (基础指令集)
+# avx512bw - AVX512 Byte and Word Instructions
+# avx512cd - AVX512 Conflict Detection Instructions
+# avx512dq - AVX512 Doubleword and Quadword Instructions
+# avx512vl - AVX512 Vector Length Extensions
 
 # set RUSTFLAGS=-C target-feature=+avx2
 # cargo build --release
 [dependencies]
 libc = "*"
 rayon = "*"
+lazy_static = "*"
 
 [lib]
 name = "findpoints" #生成dll的文件名
